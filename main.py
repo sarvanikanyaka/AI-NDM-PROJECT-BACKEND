@@ -9,6 +9,8 @@ import secrets
 import smtplib
 import tempfile
 import re
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -509,7 +511,11 @@ def detect_fake_nda(review: ReviewResponse) -> dict[str, str | int]:
 
 
 def send_otp_email(email: str, otp: str) -> None:
-    """Send OTP email using configured SMTP settings."""
+    """Send OTP email using Resend HTTPS API when configured, otherwise SMTP."""
+    resend_api_key = os.getenv("RESEND_API_KEY")
+    if resend_api_key:
+        send_otp_with_resend(email, otp, resend_api_key)
+        return
     smtp_host = os.getenv("SMTP_HOST")
     smtp_user = os.getenv("SMTP_USER")
     smtp_password = os.getenv("SMTP_PASSWORD")
@@ -568,9 +574,56 @@ def send_otp_email(email: str, otp: str) -> None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Email OTP could not be sent. Check SMTP_HOST, SMTP_PORT, SMTP_USER, "
-                "SMTP_PASSWORD, SMTP_FROM, and your internet connection."
+                "Email OTP could not be sent through SMTP. Railway may block SMTP networking. "
+                "Use RESEND_API_KEY and RESEND_FROM for HTTPS email delivery, or check "
+                "SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM."
             ),
+        ) from exc
+
+
+def send_otp_with_resend(email: str, otp: str, api_key: str) -> None:
+    """Send OTP email through Resend's HTTPS API for cloud deployments."""
+    sender = os.getenv("RESEND_FROM", "Legal Review <onboarding@resend.dev>")
+    payload = {
+        "from": sender,
+        "to": [email],
+        "subject": "Your Legal Contract Review Agent OTP",
+        "text": (
+            "Welcome to Legal Contract Review Agent.\n\n"
+            f"Your verification OTP is: {otp}\n\n"
+            "This OTP expires in 10 minutes. Do not share it with anyone."
+        ),
+    }
+    request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status >= 400:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Email OTP provider rejected the request. Check RESEND_FROM and domain settings.",
+                )
+    except urllib.error.HTTPError as exc:
+        LOGGER.warning("Resend OTP send failed with HTTP %s.", exc.code)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Email OTP provider rejected the request. Check RESEND_API_KEY, "
+                "RESEND_FROM, and your Resend sender/domain verification."
+            ),
+        ) from exc
+    except urllib.error.URLError as exc:
+        LOGGER.warning("Resend OTP network failure: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Email OTP provider could not be reached from Railway. Try again or check provider status.",
         ) from exc
 
 
