@@ -45,8 +45,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(","),
+        (
+            "http://localhost:5173,"
+            "http://127.0.0.1:5173,"
+            "https://ai-ndm-project-frontend-production.up.railway.app"
+        ),
+    ).replace(" ", "").split(","),
     allow_origin_regex=os.getenv(
         "CORS_ORIGIN_REGEX",
         r"https://.*\.(up\.railway\.app|vercel\.app|netlify\.app)",
