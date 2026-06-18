@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import secrets
 import smtplib
@@ -11,6 +12,8 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from hashlib import sha256
+from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
@@ -29,6 +32,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 LOGGER = logging.getLogger(__name__)
+DATA_DIR = Path(os.getenv("APP_DATA_DIR", ".data"))
+USERS_FILE = DATA_DIR / "users.json"
 
 app = FastAPI(
     title="Legal Contract Review & Risk Detection Agent",
@@ -42,6 +47,10 @@ app.add_middleware(
         "CORS_ORIGINS",
         "http://localhost:5173,http://127.0.0.1:5173",
     ).split(","),
+    allow_origin_regex=os.getenv(
+        "CORS_ORIGIN_REGEX",
+        r"https://.*\.(up\.railway\.app|vercel\.app|netlify\.app)",
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -174,6 +183,12 @@ async def user_error_handler(_request, exc: UserFacingError) -> JSONResponse:
     )
 
 
+@app.on_event("startup")
+def load_persisted_users() -> None:
+    """Load verified users from disk when the API process starts."""
+    users.update(read_users_from_disk())
+
+
 @app.get("/health")
 def health_check() -> dict[str, str]:
     """Return service health."""
@@ -264,12 +279,13 @@ def register_user(request: RegisterRequest) -> RegisterResponse:
     users[email] = {
         "name": request.name.strip(),
         "email": email,
-        "password": request.password,
+        "password_hash": hash_password(request.password),
         "verified": False,
         "otp": otp,
         "otp_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
     }
     send_otp_email(email, otp)
+    persist_users()
     return RegisterResponse(
         message="Registration successful. We sent a 6-digit OTP to your email.",
         email=email,
@@ -293,6 +309,7 @@ def verify_otp(request: OtpVerifyRequest) -> VerifyResponse:
     user["verified"] = True
     user["otp"] = ""
     user["otp_expires_at"] = ""
+    persist_users()
     return VerifyResponse(message="Email verified successfully. You can login now.", verified=True)
 
 
@@ -301,7 +318,7 @@ def login_user(request: LoginRequest) -> LoginResponse:
     """Login only after email verification succeeds."""
     email = normalize_email(request.email)
     user = users.get(email)
-    if not user or user["password"] != request.password:
+    if not user or not verify_password(request.password, user):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     if not bool(user["verified"]):
         raise HTTPException(status_code=403, detail="Please verify your email before login.")
@@ -320,6 +337,29 @@ def review_upload_history(authorization: str | None = Header(default=None)) -> l
     """Return files reviewed during the current server session."""
     require_session(authorization)
     return history_items[:25]
+
+
+@app.delete("/api/history/{item_id}")
+def delete_history_item(item_id: str, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Delete one history item from the current server session."""
+    require_session(authorization)
+    before_count = len(history_items)
+    history_items[:] = [
+        item
+        for item in history_items
+        if f"{item.document_name}-{item.reviewed_at}" != item_id
+    ]
+    if len(history_items) == before_count:
+        raise HTTPException(status_code=404, detail="History item was not found.")
+    return {"message": "History item deleted."}
+
+
+@app.delete("/api/history")
+def clear_upload_history(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Clear upload history for the current server session."""
+    require_session(authorization)
+    history_items.clear()
+    return {"message": "History cleared."}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -533,6 +573,67 @@ def send_otp_email(email: str, otp: str) -> None:
 def generate_otp() -> str:
     """Generate a six-digit email verification OTP."""
     return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def hash_password(password: str) -> str:
+    """Hash a password with a per-user random salt."""
+    salt = secrets.token_hex(16)
+    digest = sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return f"{salt}:{digest}"
+
+
+def verify_password(password: str, user: dict[str, str | bool]) -> bool:
+    """Check a login password against a stored hash or legacy value."""
+    password_hash = str(user.get("password_hash", ""))
+    if password_hash:
+        try:
+            salt, expected_digest = password_hash.split(":", 1)
+        except ValueError:
+            return False
+        digest = sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+        return secrets.compare_digest(digest, expected_digest)
+    legacy_password = str(user.get("password", ""))
+    return bool(legacy_password) and secrets.compare_digest(legacy_password, password)
+
+
+def read_users_from_disk() -> dict[str, dict[str, str | bool]]:
+    """Read persisted auth users without exposing secrets in logs."""
+    if not USERS_FILE.exists():
+        return {}
+    try:
+        with USERS_FILE.open("r", encoding="utf-8") as user_file:
+            raw_users = json.load(user_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Could not load persisted users: %s", exc)
+        return {}
+    if not isinstance(raw_users, dict):
+        return {}
+    return {
+        normalize_email(email): user
+        for email, user in raw_users.items()
+        if isinstance(email, str) and isinstance(user, dict)
+    }
+
+
+def persist_users() -> None:
+    """Persist users so login still works after a process restart."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        safe_users = {
+            email: {
+                "name": str(user.get("name", "")),
+                "email": str(user.get("email", email)),
+                "password_hash": str(user.get("password_hash", "")),
+                "verified": bool(user.get("verified", False)),
+                "otp": str(user.get("otp", "")),
+                "otp_expires_at": str(user.get("otp_expires_at", "")),
+            }
+            for email, user in users.items()
+        }
+        with USERS_FILE.open("w", encoding="utf-8") as user_file:
+            json.dump(safe_users, user_file, indent=2)
+    except OSError as exc:
+        LOGGER.warning("Could not persist users: %s", exc)
 
 
 def normalize_email(email: str) -> str:
