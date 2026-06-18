@@ -1,0 +1,14 @@
+[MASTER]
+ignore=tests
+
+[MESSAGES CONTROL]
+disable=missing-module-docstring,too-few-public-methods,duplicate-code
+
+[FORMAT]
+max-line-length=100
+
+[DESIGN]
+max-args=6
+max-locals=18
+max-branches=14
+max-statements=60
